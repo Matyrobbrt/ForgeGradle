@@ -23,6 +23,7 @@ import org.gradle.api.artifacts.repositories.AuthenticationSupported;
 import org.gradle.api.artifacts.repositories.MavenArtifactRepository;
 import org.gradle.api.credentials.Credentials;
 import org.gradle.api.credentials.PasswordCredentials;
+import org.gradle.api.internal.artifacts.repositories.DefaultMavenLocalArtifactRepository;
 import org.gradle.authentication.http.BasicAuthentication;
 import org.xml.sax.SAXException;
 
@@ -144,7 +145,7 @@ public class MavenArtifactDownloader {
             List<ArtifactRepository> others = new ArrayList<>();
 
             project.getRepositories().forEach( repo -> {
-                if (repo instanceof MavenArtifactRepository)
+                if (repo instanceof MavenArtifactRepository && !(repo instanceof DefaultMavenLocalArtifactRepository))
                     mavens.add((MavenArtifactRepository)repo);
                 else if (repo instanceof GradleRepositoryAdapter)
                     fakes.add((GradleRepositoryAdapter)repo);
@@ -307,6 +308,7 @@ public class MavenArtifactDownloader {
 
         Configuration cfg = project.getConfigurations().create(name);
         ExternalModuleDependency dependency = (ExternalModuleDependency)project.getDependencies().create(mine.getDescriptor());
+        dependency.setTransitive(false); // We never wanted transitives
         dependency.setChanging(changing);
         cfg.getDependencies().add(dependency);
         cfg.resolutionStrategy(strat -> {

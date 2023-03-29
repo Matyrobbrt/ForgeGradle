@@ -51,8 +51,16 @@ tasks.named('sourcesJar', Jar).configure {
 }
 
 repositories {
+    exclusiveContent {
+        forRepositories(mavenLocal())
+        filter {
+            it.includeModule('net.minecraftforge', 'ducker')
+        }
+    }
     mavenLocal()
+    mavenCentral()
     maven { url = 'https://maven.minecraftforge.net/' }
+    maven { url = 'https://jitpack.io' }
 }
 
 license {

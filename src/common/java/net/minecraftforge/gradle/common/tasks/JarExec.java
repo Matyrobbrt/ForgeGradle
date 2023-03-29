@@ -40,6 +40,7 @@ import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
 import java.io.OutputStream;
+import java.io.OutputStreamWriter;
 import java.io.PrintWriter;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -109,7 +110,7 @@ public abstract class JarExec extends DefaultTask {
         final ConfigurableFileCollection classpath = getProject().files(getToolJar(), getClasspath());
         final File workingDirectory = workDir.get().getAsFile();
 
-        try (PrintWriter log = new PrintWriter(hasLog ? new FileWriter(logFile) : NullWriter.DEFAULT, true)) {
+        try (PrintWriter log = new PrintWriter(hasLog ? new FileWriter(logFile) : new OutputStreamWriter(System.out), true)) {
             getProject().javaexec(spec -> {
                 spec.setExecutable(getEffectiveExecutable());
                 spec.setDebug(debug);

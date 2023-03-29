@@ -6,6 +6,7 @@
 package net.minecraftforge.gradle.userdev;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import net.minecraftforge.artifactural.api.artifact.ArtifactIdentifier;
 import net.minecraftforge.artifactural.api.repository.Repository;
 import net.minecraftforge.artifactural.base.repository.ArtifactProviderBuilder;
@@ -75,6 +76,7 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URI;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
@@ -88,14 +90,20 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.function.Predicate;
+import java.util.jar.JarFile;
+import java.util.jar.JarInputStream;
+import java.util.jar.JarOutputStream;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -1045,7 +1053,112 @@ public class MinecraftUserRepo extends BaseRepo {
     }
 
     @Nullable
-    private File findPatched(boolean generate) throws IOException {
+    private File findPatched(boolean generate, String mappings) throws IOException {
+        final File patched = createPatched(generate);
+        if (patched == null) return null;
+        final File withMixinsSrc = cacheMapped(mappings, "sources-wmixins", "jar");
+        if (withMixinsSrc.exists() || !generate) {
+            return withMixinsSrc;
+        }
+
+        final File mixinsOnly = cacheRaw("mixins", "jar");
+        if (!mixinsOnly.exists()) {
+            try (final ZipOutputStream mn = new ZipOutputStream(new FileOutputStream(mixinsOnly));
+                 final ZipInputStream universal = new ZipInputStream(new FileInputStream(parent.getUniversal()))) {
+                Utils.copyZipEntries(mn, universal, s -> {
+                    System.out.println("Attempted " + s);
+                    return s.equals("META-INF/MANIFEST.MF") || s.endsWith(".refmap.json") || s.endsWith(".mixins.json") || (s.endsWith(".class") && s.startsWith("net/minecraftforge/mixin/"));
+                });
+            }
+        }
+
+        final File rawNoMixins = cacheMapped(mappings, "raw-no-mixins", "jar");
+        if (!rawNoMixins.exists()) {
+            try (final ZipOutputStream mn = new ZipOutputStream(new FileOutputStream(rawNoMixins));
+                 final ZipInputStream universal = new ZipInputStream(new FileInputStream(findRaw(mappings)))) {
+                Utils.copyZipEntries(mn, universal, s -> !s.endsWith(".refmap.json") && !s.endsWith(".mixins.json") && !s.startsWith("net/minecraftforge/mixin/") && s.endsWith(".class"));
+            }
+        }
+
+        final File srg2Mcp = findSrgToMcp(mappings, findMapping(mappings));
+        applyMixins(srg2Mcp, mixinsOnly, rawNoMixins, patched, withMixinsSrc);
+        return withMixinsSrc;
+    }
+
+    private void applyMixins(File srg2mcp, File mixinJar, File target, File patched, File srcFile) throws IOException {
+        final File output = new File(project.getBuildDir(), "duckerOutput/binary"); deleteIfExists(output);
+        final File sources = new File(project.getBuildDir(), "duckerOutput/sources"); deleteIfExists(sources);
+
+        System.out.println(srg2mcp.getAbsolutePath());
+        JarExec rename = createTask("applyMixins", JarExec.class);
+        rename.setHasLog(false);
+        rename.getTool().set(Utils.DUCKER);
+        rename.getArgs().set(Lists.newArrayList(
+                "--target", target.getAbsolutePath(),
+                "--mixin", mixinJar.getAbsolutePath(),
+                "-o", output.getAbsolutePath(),
+                "--sources", sources.getAbsolutePath(),
+                "-p", "net.minecraft"
+        ));
+//        rename.getJvmArgs().add("-Dnet.minecraftforge.gradle.GradleStart.srg.srg-mcp=" + srg2mcp.getAbsolutePath());
+//        rename.getJvmArgs().add("-Dmixin.env.remapRefMap=true");
+//        rename.getJvmArgs().add("-Dmixin.env.refMapRemappingFile=" + srg2mcp.getAbsolutePath());
+
+        mcp.getLibraries().forEach(e -> rename.getArgs().addAll("--classpath", MavenArtifactDownloader.gradle(project, e, false).getAbsolutePath()));
+
+        Patcher patcher = parent;
+        while (patcher != null) {
+            for (String lib : patcher.getLibraries()) {
+                Artifact af = Artifact.from(lib);
+                //Gradle only allows one dependency with the same group:name. So if we depend on any claissified deps, repackage it ourselves.
+                // Gradle also seems to not be able to reference itself. So we add it elseware.
+                if (GROUP.equals(af.getGroup()) && NAME.equals(af.getName()) && VERSION.equals(af.getVersion())) {
+                } else {
+                    rename.getArgs().addAll("--classpath", MavenArtifactDownloader.gradle(project, lib, false).getAbsolutePath());
+                }
+            }
+            patcher = patcher.getParent();
+        }
+
+        rename.apply();
+
+        System.out.println("Mixin applied!");
+        final Path sourcesPath = sources.toPath();
+        final Set<String> added = new HashSet<>();
+        added.add("META-INF/MANIFEST.MF");
+        try (final JarOutputStream srcOut = new JarOutputStream(new FileOutputStream(srcFile), new JarFile(patched).getManifest());
+            final Stream<Path> theSources = Files.find(sourcesPath, Integer.MAX_VALUE, (path, basicFileAttributes) -> path.toString().endsWith(".java"))) {
+            final Iterator<Path> itr = theSources.iterator();
+            while (itr.hasNext()) {
+                final Path next = itr.next();
+                final String path = sourcesPath.relativize(next).toString().replace('\\', '/');
+                added.add(path);
+                srcOut.putNextEntry(Utils.getStableEntry(path));
+                try (final InputStream is = Files.newInputStream(next)) {
+                    IOUtils.copy(is, srcOut);
+                }
+                srcOut.closeEntry();
+                System.out.println("Added: " + path);
+            }
+
+            Utils.copyZipEntries(srcOut, new ZipInputStream(new FileInputStream(patched)), s -> {
+                final boolean canCopy = !added.contains(s);
+                if (!canCopy) {
+                    System.out.println("Will not copy: " + s + "!");
+                }
+                return canCopy;
+            });
+        }
+    }
+
+    private static void deleteIfExists(File file) throws IOException {
+        if (file.exists()) {
+            FileUtils.deleteDirectory(file);
+        }
+    }
+
+    @Nullable
+    private File createPatched(boolean generate) throws IOException {
         File decomp = findDecomp(generate);
         if (decomp == null || !decomp.exists()) {
             debug("  Finding Patched: Decomp not found");
@@ -1138,7 +1251,7 @@ public class MinecraftUserRepo extends BaseRepo {
 
     @Nullable
     private File findSource(@Nullable String mapping, boolean generate) throws IOException {
-        File patched = findPatched(generate);
+        File patched = findPatched(generate, mapping);
         if (patched == null || !patched.exists()) {
             debug("  Finding Source: Patched not found");
             return null;
@@ -1207,6 +1320,8 @@ public class MinecraftUserRepo extends BaseRepo {
 
     @Nullable
     private File findRecomp(@Nullable String mapping, boolean generate) throws IOException {
+        if (true) return null; // TODO - mixin version detection
+
         File source = findSource(mapping, generate);
         if (source == null || !source.exists()) {
             debug("  Finding Recomp: Sources not found");

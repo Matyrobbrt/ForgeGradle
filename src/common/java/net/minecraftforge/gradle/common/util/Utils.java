@@ -70,7 +70,7 @@ import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
 public class Utils {
-    private static final boolean ENABLE_FILTER_REPOS = Boolean.parseBoolean(System.getProperty("net.minecraftforge.gradle.filter_repos", "true"));
+    private static final boolean ENABLE_FILTER_REPOS = Boolean.parseBoolean(System.getProperty("net.minecraftforge.gradle.filter_repos", "false"));
 
     public static final Gson GSON = new GsonBuilder()
         .registerTypeAdapter(MCPConfigV1.Step.class, new MCPConfigV1.Step.Deserializer())
@@ -88,6 +88,7 @@ public class Utils {
     public static final String SIDESTRIPPER = "net.minecraftforge:mergetool:1.1.5:fatjar";
     public static final String INSTALLERTOOLS = "net.minecraftforge:installertools:1.3.2:fatjar";
     public static final String JARCOMPATIBILITYCHECKER = "net.minecraftforge:JarCompatibilityChecker:0.1.+:all";
+    public static final String DUCKER = "net.minecraftforge:ducker-arbiter:1.0-SNAPSHOT";
     public static final long ZIPTIME = 628041600000L;
     public static final TimeZone GMT = TimeZone.getTimeZone("GMT");
 
