@@ -6,6 +6,8 @@
 package net.minecraftforge.gradle.userdev;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
+import com.google.gson.Gson;
 import net.minecraftforge.artifactural.api.artifact.ArtifactIdentifier;
 import net.minecraftforge.artifactural.api.repository.Repository;
 import net.minecraftforge.artifactural.base.repository.ArtifactProviderBuilder;
@@ -40,7 +42,7 @@ import net.minecraftforge.gradle.userdev.tasks.AccessTransformJar;
 import net.minecraftforge.gradle.userdev.tasks.ApplyMCPFunction;
 import net.minecraftforge.gradle.userdev.tasks.HackyJavaCompile;
 import net.minecraftforge.gradle.userdev.tasks.RenameJar;
-import net.minecraftforge.gradle.userdev.tasks.RenameJarInPlace;
+import net.minecraftforge.gradle.userdev.util.MixinConfig;
 import net.minecraftforge.srgutils.IMappingFile;
 import net.minecraftforge.srgutils.IMappingFile.IField;
 import net.minecraftforge.srgutils.IMappingFile.IMethod;
@@ -67,6 +69,12 @@ import com.google.common.collect.Sets;
 import org.gradle.api.plugins.JavaPluginExtension;
 import org.gradle.api.provider.Property;
 import org.gradle.jvm.toolchain.JavaLanguageVersion;
+import org.objectweb.asm.ClassReader;
+import org.objectweb.asm.ClassVisitor;
+import org.objectweb.asm.ClassWriter;
+import org.objectweb.asm.Label;
+import org.objectweb.asm.MethodVisitor;
+import org.objectweb.asm.Opcodes;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -75,7 +83,12 @@ import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.io.Reader;
 import java.net.URI;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.charset.Charset;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.FileSystem;
@@ -90,12 +103,20 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.NavigableMap;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.function.Predicate;
+import java.util.jar.Attributes;
+import java.util.jar.JarFile;
+import java.util.jar.JarInputStream;
+import java.util.jar.JarOutputStream;
+import java.util.jar.Manifest;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -126,6 +147,7 @@ public class MinecraftUserRepo extends BaseRepo {
     @SuppressWarnings("unused")
     private Repository repo;
     private Set<File> extraDataFiles;
+    private boolean applyMixins;
 
     /* TODO:
      * Steps to produce each dep:
@@ -148,7 +170,7 @@ public class MinecraftUserRepo extends BaseRepo {
      * Version Setup:
      *   [Version]_mapped_[mapping]_at_[AtHash]
      */
-    public MinecraftUserRepo(Project project, String group, String name, String version, List<File> ats, String mapping) {
+    public MinecraftUserRepo(Project project, String group, String name, String version, List<File> ats, String mapping, boolean applyMixins) {
         super(Utils.getCache(project, "minecraft_user_repo"), project.getLogger());
         this.project = project;
         this.GROUP = group;
@@ -168,6 +190,7 @@ public class MinecraftUserRepo extends BaseRepo {
             .filter(ArtifactIdentifier.nameEquals(NAME))
             .provide(this)
         );
+        this.applyMixins = applyMixins;
     }
 
     @Override
@@ -437,7 +460,7 @@ public class MinecraftUserRepo extends BaseRepo {
         } else {
             switch (classifier) {
                 case "":        return findRaw(mappings);
-                case "sources": return findSource(mappings, true);
+                case "sources": return applyMixins ? findMixinSource(mappings, true) : findPatchedSource(mappings, true);
                 default:        return findExtraClassifier(mappings, classifier, ext);
             }
         }
@@ -572,10 +595,12 @@ public class MinecraftUserRepo extends BaseRepo {
             return null;
         }
 
-        File recomp = findRecomp(mapping, false);
-        if (recomp != null) {
-            debug("  Finding Raw: Returning Recomp: " + recomp);
-            return recomp;
+        if (!applyMixins) {
+            File recomp = findRecomp(mapping, false);
+            if (recomp != null) {
+                debug("  Finding Raw: Returning Recomp: " + recomp);
+                return recomp;
+            }
         }
 
         if (mapping == null && parent == null) {
@@ -583,10 +608,27 @@ public class MinecraftUserRepo extends BaseRepo {
             return null;
         }
 
+        File wLineNumbers;
+        if (applyMixins) {
+            wLineNumbers = findWLineNumbersFix(mapping, names, null);
+            if (wLineNumbers != null && wLineNumbers.exists()) {
+                debug("  Finding Raw: Returning with fixed line numbers: " + wLineNumbers);
+                return wLineNumbers;
+            }
+        }
+
         File bin = cacheMapped(mapping, "jar");
         cache.load(cacheMapped(mapping, "jar.input"));
         if (cache.isSame() && bin.exists()) {
             debug("  Finding Raw: Cache Hit: " + bin);
+            if (applyMixins) {
+                wLineNumbers = findWLineNumbersFix(mapping, names, bin);
+                if (wLineNumbers != null && wLineNumbers.exists()) {
+                    debug("  Finding Raw: Returning with fixed line numbers: " + wLineNumbers);
+                    return wLineNumbers;
+                }
+            }
+            return bin;
         } else {
             debug("  Finding Raw: Cache Miss");
             StringBuilder baseAT = new StringBuilder();
@@ -716,24 +758,128 @@ public class MinecraftUserRepo extends BaseRepo {
                 at.apply();
             }
 
+            File withMixin = cacheRaw("withmixins", "jar");
+            if (applyMixins && !withMixin.exists()) {
+                final Path outMixin = cache(GROUP.replace('.', File.separatorChar), NAME, VERSION, "duckerout").toPath();
+
+                debug("    Apply jar mixins");
+                JarExec applyMixins = createTask("applyMixins", JarExec.class);
+                applyMixins.setHasLog(true);
+                applyMixins.getTool().set(Utils.DUCKER);
+                applyMixins.getArgs().empty();
+                final String target = (hasAts ? bin : injected).getAbsolutePath();
+                applyMixins.getArgs().addAll("-t", target);
+                applyMixins.getArgs().addAll("-m", target);
+                applyMixins.getArgs().addAll("--transformer", "MIXIN_METHOD_REMAPPER_PRIVATIZER", "--transformer", "ACCESSOR_DESYNTHESIZER", "--transformer", "SOURCE_MAP_STRIPPER", "--transformer", "OVERWRITE_FIXER");
+                getConfigs(hasAts ? bin : injected)
+                        .stream().flatMap(MixinConfig::getExtractionPackages)
+                        .forEach(cfg -> applyMixins.getArgs().addAll("-p", cfg));
+                applyMixins.getArgs().addAll("-o", outMixin.toString());
+
+                try (final InputStream depsStream = new FileInputStream(findDeps())) {
+                    Utils.lines(depsStream).forEach(dep -> applyMixins.getArgs().addAll("--classpath", dep));
+                }
+
+                applyMixins.apply();
+                debug("    Merging back the jar with mixins");
+
+                final Set<Path> copiedFiles = new HashSet<>();
+                try (final ZipInputStream in = new ZipInputStream(new FileInputStream((hasAts ? bin : injected)));
+                    final ZipOutputStream out = new ZipOutputStream(new FileOutputStream(withMixin))) {
+                    ZipEntry entry;
+                    while ((entry = in.getNextEntry()) != null) {
+                        if (!entry.isDirectory()) {
+                            ZipEntry _new = new ZipEntry(entry.getName());
+                            _new.setTime(0); //SHOULD be the same time as the main entry, but NOOOO _new.setTime(entry.getTime()) throws DateTimeException, so you get 0, screw you!
+                            out.putNextEntry(_new);
+
+                            final Path fromDucker = outMixin.resolve(entry.getName());
+                            if (Files.exists(fromDucker)) {
+                                copiedFiles.add(fromDucker.normalize());
+                                System.out.println("Copying " + fromDucker);
+                                try (final InputStream inD = Files.newInputStream(fromDucker)) {
+                                    IOUtils.copy(inD, out);
+                                }
+                            } else {
+                                IOUtils.copy(in, out);
+                            }
+                            out.closeEntry();
+                        }
+                    }
+
+                    try (final Stream<Path> extra = Files.find(outMixin, Integer.MAX_VALUE, (path, basicFileAttributes) -> Files.isRegularFile(path) && !copiedFiles.contains(path))) {
+                        final Iterator<Path> itr = extra.iterator();
+                        while (itr.hasNext()) {
+                            final Path next = itr.next();
+                            ZipEntry _new = new ZipEntry(outMixin.relativize(next).toString());
+                            _new.setTime(0); //SHOULD be the same time as the main entry, but NOOOO _new.setTime(entry.getTime()) throws DateTimeException, so you get 0, screw you!
+                            out.putNextEntry(_new);
+                            try (final InputStream inD = Files.newInputStream(next)) {
+                                IOUtils.copy(inD, out);
+                            }
+                            out.closeEntry();
+                        }
+                    }
+                }
+            }
+
             debug("    Renaming/Fixing " + (hasAts ? "ATed" : "injected") + " jar");
             JarExec rename = createTask("renameJar", JarExec.class);
             rename.setHasLog(false);
             rename.getTool().set(Utils.FART);
             rename.getArgs().empty();
-            rename.getArgs().addAll("--input", (hasAts ? bin : injected).getAbsolutePath());
-            if (!hasAts)
+            rename.getArgs().addAll("--input", (applyMixins ? withMixin.getAbsolutePath() : (hasAts ? bin : injected).getAbsolutePath()));
+            if (!hasAts || applyMixins)
                 rename.getArgs().addAll("--output", bin.getAbsolutePath());
             if (mapping != null)
                 rename.getArgs().addAll("--map", findSrgToMcp(mapping, names).getAbsolutePath());
             rename.getArgs().add("--src-fix"); // Set SourceFile attribute so IDEs will link decomped code on first pass, Line numbers will be screwy, but that's a todo.
             rename.apply();
 
+            try (final FileSystem fs = FileSystems.newFileSystem(bin.toPath(), (ClassLoader) null)) {
+                final Path mfPath = fs.getPath("META-INF", "MANIFEST.MF");
+                final Manifest mf;
+                try (final InputStream in = Files.newInputStream(mfPath)) {
+                    mf = new Manifest(in);
+                    final String oldConfigs = mf.getMainAttributes().getValue("MixinConfigs");
+                    if (oldConfigs != null) {
+                        mf.getMainAttributes().remove(new Attributes.Name("MixinConfigs"));
+                        mf.getMainAttributes().putValue("DisabledMixinConfigs", oldConfigs);
+                    }
+                }
+                try (final OutputStream out = Files.newOutputStream(mfPath)) {
+                    mf.write(out);
+                }
+            }
+
             debug("    Finished: " + bin);
             Utils.updateHash(bin, HashFunction.SHA1);
             cache.save();
         }
         return bin;
+    }
+
+    private File findDeps() throws IOException {
+        final File deps = cacheRaw("deps", "txt");
+        if (deps.exists()) return deps;
+        final List<String> depsList = new ArrayList<>();
+        mcp.getLibraries().forEach(e -> depsList.add(MavenArtifactDownloader.gradle(project, e, false).getAbsolutePath()));
+
+        Patcher patcher = parent;
+        while (patcher != null) {
+            for (String lib : patcher.getLibraries()) {
+                Artifact af = Artifact.from(lib);
+                //Gradle only allows one dependency with the same group:name. So if we depend on any claissified deps, repackage it ourselves.
+                // Gradle also seems to not be able to reference itself. So we add it elseware.
+                if (GROUP.equals(af.getGroup()) && NAME.equals(af.getName()) && VERSION.equals(af.getVersion())) {
+                } else {
+                    depsList.add(MavenArtifactDownloader.gradle(project, lib, false).getAbsolutePath());
+                }
+            }
+            patcher = patcher.getParent();
+        }
+        Files.write(deps.toPath(), depsList);
+        return deps;
     }
 
     @Nullable
@@ -1141,7 +1287,135 @@ public class MinecraftUserRepo extends BaseRepo {
     }
 
     @Nullable
-    private File findSource(@Nullable String mapping, boolean generate) throws IOException {
+    private File findMixinSource(@Nullable String mapping, boolean generate) throws IOException {
+        File names = findMapping(mapping);
+        if (mapping != null && names == null) {
+            debug("  Finding Sources: Mapping not found");
+            return null;
+        }
+        McpNames map = McpNames.load(names);
+        HashStore cache = commonHash(names);
+        File sources = cacheMapped(mapping, "sources", "jar");
+        debug("  Finding Source: " + sources);
+        cache.load(cacheMapped(mapping, "sources", "jar.input"));
+        if (cache.isSame() && sources.exists()) {
+            debug("    Cache hit");
+        } else if (sources.exists() || generate) {
+            final Path outDecomp = cache(GROUP.replace('.', File.separatorChar), NAME, getVersion(mapping), "decomp").toPath();
+            Files.createDirectories(outDecomp);
+            File raw = findRaw(mapping);
+            if (raw == null) {
+                debug("  Finding Sources: Raw not found");
+                return null;
+            }
+
+            final Set<String> packagesToDecomp = getConfigs(raw).stream()
+                    .flatMap(MixinConfig::getExtractionPackages).map(p -> p.replace('.', '/') + '/')
+                    .collect(Collectors.toSet());
+
+            final Path decomp = outDecomp.resolve("decomp.jar");
+            final Path decompOutput = outDecomp.resolve("out").toAbsolutePath();
+            final Path classpath = outDecomp.resolve("cp.jar");
+            final Manifest manifest;
+            try (final JarInputStream in = new JarInputStream(new FileInputStream(raw));
+                 final ZipOutputStream decompO = new ZipOutputStream(Files.newOutputStream(decomp));
+                 final ZipOutputStream classpathO = new ZipOutputStream(Files.newOutputStream(classpath))) {
+                manifest = in.getManifest();
+                ZipEntry entry;
+                while ((entry = in.getNextEntry()) != null) {
+                    if (entry.getName().endsWith(".class")) {
+                        final ZipEntry entryNew = new ZipEntry(entry.getName());
+                        ZipOutputStream out = classpathO;
+                        for (final String pkg : packagesToDecomp) {
+                            if (entry.getName().startsWith(pkg)) {
+                                out = decompO;
+                                break;
+                            }
+                        }
+
+                        out.putNextEntry(entryNew);
+                        IOUtils.copy(in, out);
+                        out.closeEntry();
+                    }
+                }
+
+            }
+
+            JarExec decompMixins = createTask("decompileMixins", JarExec.class);
+            decompMixins.setHasLog(true);
+            decompMixins.getTool().set(Utils.FORGEFLOWER);
+            decompMixins.getArgs().empty();
+            decompMixins.getArgs().addAll();
+            decompMixins.getArgs().addAll("-din=1", "-rbr=1", "-dgs=1", "-asc=1", "-rsy=1", "-iec=1", "-jvn=1", "-isl=0", "-iib=1", "-bsm=1", "-dcl=1", "-log=TRACE");
+
+            try (final Stream<String> lines = Utils.lines(new FileInputStream(findDeps()))) {
+                lines.forEach(line -> decompMixins.getArgs().add("-e=" + line));
+            }
+            decompMixins.getArgs().add("-e=" + classpath.toAbsolutePath());
+
+            final String decompPath = decomp.toAbsolutePath().toString();
+            decompMixins.getArgs().addAll(decompPath, decompOutput.toString());
+            debug("    Decompiling mixins");
+            decompMixins.apply();
+
+            try (final ZipOutputStream out = new JarOutputStream(new FileOutputStream(sources), manifest);
+                final ZipInputStream inDecomp = new ZipInputStream(Files.newInputStream(decompOutput))) {
+                final Set<String> added = new HashSet<>();
+                added.add("META-INF/MANIFEST.MF");
+
+                ZipEntry inEntry;
+                while ((inEntry = inDecomp.getNextEntry()) != null) {
+                    if (!inEntry.isDirectory()) {
+                        added.add(inEntry.getName());
+                        final ZipEntry newEntry = new ZipEntry(inEntry.getName());
+                        newEntry.setExtra(inEntry.getExtra());
+                        out.putNextEntry(newEntry);
+                        IOUtils.copy(inDecomp, out);
+                        out.closeEntry();
+                    }
+                }
+
+                copyResources(out, added, false);
+
+                // Walk parents and combine from bottom up so we get any overridden files.
+                Patcher patcher = parent;
+                while (patcher != null) {
+                    if (patcher.getSources() != null) {
+                        Charset sourceFileCharset = parent == null || parent.getConfigV2() == null ? StandardCharsets.UTF_8 :
+                                Charset.forName(parent.getConfigV2().getSourceFileCharset());
+                        try (ZipInputStream zin = new ZipInputStream(new FileInputStream(patcher.getSources()))) {
+                            ZipEntry entry;
+                            while ((entry = zin.getNextEntry()) != null) {
+                                if (!added.add(entry.getName())) continue;
+                                ZipEntry _new = new ZipEntry(entry.getName());
+                                _new.setTime(0); //SHOULD be the same time as the main entry, but NOOOO _new.setTime(entry.getTime()) throws DateTimeException, so you get 0, screw you!
+                                out.putNextEntry(_new);
+
+                                if (entry.getName().endsWith(".java")) {
+                                    String mapped = map.rename(zin,
+                                            true,
+                                            true, sourceFileCharset);
+                                    IOUtils.write(mapped, out, sourceFileCharset);
+                                } else {
+                                    IOUtils.copy(zin, out);
+                                }
+
+                                IOUtils.copy(zin, out);
+                                out.closeEntry();
+                            }
+                        }
+                    }
+                    patcher = patcher.getParent();
+                }
+            }
+
+            cache.save();
+        }
+        return sources;
+    }
+
+    @Nullable
+    private File findPatchedSource(@Nullable String mapping, boolean generate) throws IOException {
         File patched = findPatched(generate);
         if (patched == null || !patched.exists()) {
             debug("  Finding Source: Patched not found");
@@ -1211,7 +1485,7 @@ public class MinecraftUserRepo extends BaseRepo {
 
     @Nullable
     private File findRecomp(@Nullable String mapping, boolean generate) throws IOException {
-        File source = findSource(mapping, generate);
+        File source = findPatchedSource(mapping, generate);
         if (source == null || !source.exists()) {
             debug("  Finding Recomp: Sources not found");
             return null;
@@ -1327,6 +1601,102 @@ public class MinecraftUserRepo extends BaseRepo {
             Utils.updateHash(target, HashFunction.SHA1);
         }
         return target;
+    }
+
+    @Nullable
+    private File findWLineNumbersFix(@Nullable String mappings, File names, @Nullable File raw) throws IOException {
+        File sources = findMixinSource(mappings, false);
+        if (sources == null || !sources.exists()) {
+            debug("  Finding Line Numbers fix: Sources not generated");
+            return null;
+        }
+
+        HashStore cache = commonHash(names);
+        cache.add("source", sources);
+        cache.load(cacheMapped(mappings, "ln", "jar.input"));
+
+        File wLineNumbers = cacheMapped(mappings, "ln", "jar");
+
+        if (cache.isSame() && wLineNumbers.exists()) {
+            debug("  Finding Line Numbers fix: Cache Hit");
+        } else {
+            if (raw == null) {
+                debug("  Finding Line Numbers fix: Raw not available");
+                return null;
+            }
+
+            debug("  Finding Line Numbers fix: " + cache.isSame() + " " + wLineNumbers);
+
+            final Map<String, Map<Integer, Integer>> lineNumbers = new HashMap<>();
+            try (final ZipInputStream in = new ZipInputStream(new FileInputStream(sources))) {
+                ZipEntry entry;
+                while ((entry = in.getNextEntry()) != null) {
+                    if (entry.getName().endsWith(".java")) {
+                        if (entry.getExtra() == null || entry.getExtra().length < 5) continue;
+                        final ByteBuffer buf = ByteBuffer.wrap(entry.getExtra());
+                        buf.order(ByteOrder.LITTLE_ENDIAN);
+                        if (buf.getShort() != 0x4646) continue;
+                        final int length = (buf.getShort() - 1) / 2;
+                        final byte version = buf.get();
+                        if (version != 1) {
+                            throw new IllegalArgumentException("Unknown mapping file version: " + version + ". entry: " + entry.getName());
+                        }
+                        final int[] mapping = new int[length];
+                        for (int i = 0; i < length; i++) {
+                            mapping[i] = buf.getShort();
+                        }
+
+                        final Map<Integer, Integer> lineNumberMap = lineNumbers.computeIfAbsent(
+                                entry.getName().substring(0, entry.getName().length() - 5), // .java
+                                k -> new HashMap<>()
+                        );
+                        for (int i = 0; i < mapping.length; i += 2) {
+                            lineNumberMap.put(mapping[i], mapping[i + 1]);
+                        }
+                    }
+                }
+            }
+
+            try (final JarInputStream in = new JarInputStream(new FileInputStream(raw));
+                final JarOutputStream out = new JarOutputStream(new FileOutputStream(wLineNumbers), in.getManifest())) {
+                ZipEntry entry;
+                while ((entry = in.getNextEntry()) != null) {
+                    if (entry.isDirectory()) continue;
+
+                    out.putNextEntry(new ZipEntry(entry));
+                    if (entry.getName().endsWith(".class")) {
+                        final ClassWriter cw = new ClassWriter(0);
+                        final int innerIdx = entry.getName().indexOf('$');
+                        final String className = entry.getName().substring(0, innerIdx == -1 ? entry.getName().length() - 6 /* .class */ : innerIdx);
+                        final Map<Integer, Integer> lineNumberMap = lineNumbers.get(className);
+                        if (lineNumberMap == null) {
+                            IOUtils.copy(in, out);
+                            continue;
+                        }
+
+                        new ClassReader(in).accept(new ClassVisitor(Opcodes.ASM9, cw) {
+                            @Override
+                            public MethodVisitor visitMethod(int access, String name, String descriptor, String signature, String[] exceptions) {
+                                MethodVisitor parent = super.visitMethod(access, name, descriptor, signature, exceptions);
+                                return new MethodVisitor(Opcodes.ASM9, parent) {
+                                    @Override
+                                    public void visitLineNumber(final int line, final Label start) {
+                                        super.visitLineNumber(lineNumberMap.getOrDefault(line, line), start);
+                                    }
+                                };
+                            }
+                        }, 0);
+                        out.write(cw.toByteArray());
+                    } else {
+                        IOUtils.copy(in, out);
+                    }
+                    out.closeEntry();
+                }
+            }
+
+            cache.save();
+        }
+        return wLineNumbers;
     }
 
     private String getNextTaskName(String prefix) {
@@ -1630,4 +2000,27 @@ public class MinecraftUserRepo extends BaseRepo {
             }
         }
     }
+
+    private static List<MixinConfig> getConfigs(File file) throws IOException {
+        try (final FileSystem jarFile = FileSystems.newFileSystem(file.toPath(), (ClassLoader) null)) {
+            final Path mf = jarFile.getPath("META-INF", "MANIFEST.MF");
+            if (Files.notExists(mf)) return Collections.emptyList();
+            final Manifest manifest;
+            try (final InputStream is = Files.newInputStream(mf)) {
+                manifest = new Manifest(is);
+            }
+            String val = manifest.getMainAttributes()
+                    .getValue("MixinConfigs");
+            if ((val == null || val.isEmpty()) && (val = manifest.getMainAttributes()
+                    .getValue("DisabledMixinConfigs")) == null) return Collections.emptyList();
+            final List<MixinConfig> configs = new ArrayList<>();
+            for (final String cfg : val.split(",")) {
+                try (final Reader reader = Files.newBufferedReader(jarFile.getPath(cfg.trim()))) {
+                    configs.add(new Gson().fromJson(reader, MixinConfig.class));
+                }
+            }
+            return configs;
+        }
+    }
+
 }

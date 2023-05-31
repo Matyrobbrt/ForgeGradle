@@ -28,7 +28,7 @@ java {
 
 configurations {
     all {
-        exclude group: 'org.ow2.asm'
+        // exclude group: 'org.ow2.asm'
     }
     mcpImplementation.extendsFrom commonImplementation
     patcherImplementation.extendsFrom commonImplementation
@@ -89,6 +89,11 @@ dependencies {
     patcherImplementation sourceSets.common.output
     userdevImplementation sourceSets.mcp.output
     userdevImplementation sourceSets.common.output
+
+    userdevImplementation 'org.ow2.asm:asm:9.+'
+    userdevImplementation 'org.ow2.asm:asm-tree:9.+'
+    userdevImplementation 'org.ow2.asm:asm-util:9.+'
+    userdevImplementation 'org.ow2.asm:asm-commons:9.+'
 
     userdevImplementation 'net.minecraftforge:JarJarMetadata:0.3.19'
     userdevImplementation 'net.minecraftforge:JarJarSelector:0.3.19'

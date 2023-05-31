@@ -91,6 +91,8 @@ public class Utils {
     public static final String ACCESSTRANSFORMER = "net.minecraftforge:accesstransformers:8.0.+:fatjar";
     public static final String SPECIALSOURCE = "net.md-5:SpecialSource:1.11.2:shaded";
     public static final String FART = "net.minecraftforge:ForgeAutoRenamingTool:1.+:all";
+    public static final String DUCKER = "net.minecraftforge:ducker-arbiter:1.0.+";
+    public static final String FORGEFLOWER = "net.minecraftforge:forgeflower:1.5.498.22";
     public static final String SRG2SOURCE = "net.minecraftforge:Srg2Source:8.+:fatjar";
     public static final String SIDESTRIPPER = "net.minecraftforge:mergetool:1.1.7:fatjar";
     public static final String INSTALLERTOOLS = "net.minecraftforge:installertools:1.3.2:fatjar";
